@@ -16,9 +16,9 @@ class Brain:
     @classmethod
     def Init(cls, data, net, criterion='MSE', optimizer='Adam', lr=0.01, 
              iterations=100, batch_size=None, print_every=10, save='best_only', 
-             callback=None, dtype='float', device='cpu'):
+             callback=None, dtype='float', device='cpu', model_save_path='model'):
         cls.brain = cls(data, net, criterion, optimizer, lr, iterations, 
-                        batch_size, print_every, save, callback, dtype, device)
+                        batch_size, print_every, save, callback, dtype, device, model_save_path)
     
     @classmethod
     def Run(cls, **kwargs):
@@ -56,7 +56,7 @@ class Brain:
     
     def __init__(self, data, net, criterion='MSE', optimizer='Adam', lr=0.01, 
                  iterations=100, batch_size=None, print_every=10, save='best_only', 
-                 callback=None, dtype='float', device='cpu'):
+                 callback=None, dtype='float', device='cpu', model_save_path='model'):
         self.data = data
         self.net = net
         self.criterion = criterion
@@ -69,6 +69,7 @@ class Brain:
         self.callback = callback
         self.dtype = dtype
         self.device = device
+        self.model_save_path = model_save_path
         
         self.loss_history_list = []
         self.loss_history = None
@@ -110,14 +111,14 @@ class Brain:
                 if self.save == False:
                     pass
                 elif self.save in [True, 'best_only', 'best_only_test', 'best_only_train', 'all']:
-                    if not os.path.exists('model'): os.mkdir('model')
+                    if not os.path.exists(self.model_save_path): os.mkdir(self.model_save_path)
                     if self.save == 'all':
-                        torch.save(self.net, 'model/model{}.pkl'.format(i))
+                        torch.save(self.net, '{}/model{}.pkl'.format(self.model_save_path, i))
                     else:
                         index_temp = 1 if self.save == 'best_only_train' else 2
                         if loss_history[-1][index_temp] < loss_history[best_model_index][index_temp] or len(loss_history) == 1:
                             best_model_index = len(loss_history) - 1
-                            torch.save(self.net, 'model/model_best.pkl')
+                            torch.save(self.net, '{}/model_best.pkl'.format(self.model_save_path))
                 else:
                     raise ValueError
                 if self.callback is not None:
@@ -150,7 +151,7 @@ class Brain:
             loss_test = self.loss_history[best_loss_index, 2]
             print('Best model at iteration {}:'.format(iteration), flush=True)
             print('Train loss:', loss_train, 'Test loss:', loss_test, flush=True)
-            path = 'model/model{}.pkl'.format(iteration) if self.save == 'all' else 'model/model_best.pkl'
+            path = '{}/model{}.pkl'.format(self.model_save_path, iteration) if self.save == 'all' else '{}/model_best.pkl'.format(self.model_save_path)
             self.best_model = torch.load(path, weights_only=False)
             self.net = self.best_model
         else:
