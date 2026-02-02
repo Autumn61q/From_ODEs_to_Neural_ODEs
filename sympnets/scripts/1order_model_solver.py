@@ -10,14 +10,44 @@ import os
 # 环境配置
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-class FourthOrderHNN(ln.nn.Algorithm):
-    def __init__(self, layers, activation='tanh', initializer='orthogonal'):
-        super(FourthOrderHNN, self).__init__()
-        self.H_size = layers
+# --- 新增 Euler 积分器类，用于对齐 hnn.py 的风格 ---
+class Euler:
+    def __init__(self, H, J, N=1):
+        self.H = H
+        self.J = J
+        self.N = N
+        
+    def solve(self, x, h):
+        h_step = h / self.N
+        curr = x
+        for _ in range(self.N):
+            # 这里的梯度计算逻辑对齐 learner
+            with torch.enable_grad():
+                z = curr.detach().requires_grad_(True)
+                # 使用 learner.utils.grad，它内部会处理 batch 并返回 [N, dim]
+                dH = grad(self.H(z), z) 
+            curr = z + h_step * (dH @ self.J)
+        return curr
+
+    def flow(self, x, h, steps):
+        X = [x]
+        for _ in range(steps):
+            X.append(self.solve(X[-1], h))
+        dim = x.shape[-1]
+        size = len(x.shape)
+        shape = [steps + 1, dim] if size == 1 else [-1, steps + 1, dim]
+        return torch.cat(X, dim=-1).view(shape)
+
+# 1. 1st Order HNN Class
+class FirstOrderHNN(ln.nn.Algorithm):
+    '''First Order Hamiltonian Neural Network (using Forward Euler).'''
+    def __init__(self, H_size, activation='tanh', initializer='orthogonal'):
+        super(FirstOrderHNN, self).__init__()
+        self.H_size = H_size
         self.activation = activation
         self.initializer = initializer
         self.ms = self.__init_modules()
-
+        
     @lazy_property
     def J(self):
         d = int(self.H_size[0] / 2)
@@ -29,23 +59,23 @@ class FourthOrderHNN(ln.nn.Algorithm):
         modules['H'] = ln.nn.FNN(self.H_size, self.activation, self.initializer)
         return modules
 
-    def criterion(self, x, y):
-        x_in = x[0]
-        h = x[1]
-        x_in = x_in.requires_grad_(True)  # 确保可以计算梯度
-        # 使用 SV4 积分器计算 y_pred
-        solver = SV(self.ms['H'], None, iterations=10, order=4, N=1)
-        y_pred = solver.solve(x_in, h)
-        return torch.nn.functional.mse_loss(y_pred, y)
+    def criterion(self, x0h, x1):
+        x0, h = x0h
+        x0 = x0.requires_grad_(True)
+        # Forward Euler Loss: (x1 - x0)/h = J @ grad H(x0)
+        gradH = grad(self.ms['H'](x0), x0)
+        return torch.nn.MSELoss()((x1 - x0) / h, gradH @ self.J)
 
     def predict(self, x0, h, steps=1, keepinitx=False, returnnp=False):
         x0 = self._to_tensor(x0)
-        # 使用 4 阶辛积分器 SV4，N=1 以保证实验的步长就是 h
-        solver = SV(self.ms['H'], None, iterations=10, order=4, N=1)
+        # 对齐 hnn.py: 默认 N=1 以保证实验的步长就是 h
+        N = 1 
+        solver = Euler(self.ms['H'], self.J, N=N)
+        # 对齐 hnn.py: 使用 solver.flow
         res = solver.flow(x0, h, steps) if keepinitx else solver.flow(x0, h, steps)[..., 1:, :].squeeze()
         return res.cpu().detach().numpy() if returnnp else res
 
-# 1. 数据类：支持指定步长 h 生成轨迹
+# 2. 数据类：支持指定步长 h 生成轨迹 (1st Order)
 class FlexiblePDData(ln.Data):
     def __init__(self, x0, h, train_num, test_num, add_h=True):
         super(FlexiblePDData, self).__init__()
@@ -62,6 +92,26 @@ class FlexiblePDData(ln.Data):
     def dim(self):
         return 2
     
+    # def __generate_flow(self, x0, h, num):
+    #     # 用一阶前向欧拉 (Forward Euler) 生成轨迹
+    #     def dH(p, q):
+    #         return p, np.sin(q)
+    #     x = np.array(x0).reshape(1, -1)
+    #     traj = [x[0]]
+    #     for i in range(num):
+    #         p, q = traj[-1][0], traj[-1][1]
+    #         dp, dq = dH(p, q)
+    #         # Forward Euler: 1st Order
+    #         # p_new = p - h * dH/dq = p - h * sin(q)
+    #         # q_new = q + h * dH/dp = q + h * p
+    #         p_new = p - h * np.sin(q)
+    #         q_new = q + h * p
+    #         traj.append([p_new, q_new])
+    #     X = np.array(traj)
+    #     x, y = X[:-1], X[1:]
+    #     if self.add_h:
+    #         x = [x, self.h * np.ones([x.shape[0], 1])]
+    #     return x, y
     def __generate_flow(self, x0, h, num):
         # 改用高精度积分器（如 SV6）生成真值数据，这样 RK3 才会体现出阶数误差
         from learner.integrator.hamiltonian import SV
@@ -72,6 +122,7 @@ class FlexiblePDData(ln.Data):
         if self.add_h:
             x = [x, self.h * np.ones([x.shape[0], 1])]
         return x, y
+    
     
     def __init_data(self):
         self.X_train, self.y_train = self.__generate_flow(self.x0, self.h, self.train_num)
@@ -90,7 +141,7 @@ def run_diff_h_experiment():
     x0 = np.array([0.0, 1.0])
     train_num = 20
     test_num = 100
-    num_runs = 15
+    num_runs = 5
     iterations = 30000
     H_size = [2, 30, 30, 1]
     
@@ -102,7 +153,8 @@ def run_diff_h_experiment():
 
     for h in hs:
         print(f"\n>>>> Testing h = {h} (Consistency Mode)")
-        # 保持训练和测试的总时长恒定
+        # 保持训练和测试的总时长恒定，消除采样范围带来的机制转换
+        # T_train = 5.0, T_test = 10.0 (以 h=0.1, num=50 为基准)
         current_train_num = int(max(10.0 / h, 1))
         current_test_num = int(max(10.0 / h, 1))
         
@@ -123,25 +175,22 @@ def run_diff_h_experiment():
                 
             print(f"  Run {run+1}/{num_runs}...", end=' ', flush=True)
             
-            # 数据生成
+            # 数据生成 (Changed to 1st Order Forward Euler inside FlexiblePDData)
             data = FlexiblePDData(x0, h, current_train_num, current_test_num, add_h=True)
             
-            # 使用自定义的 4 阶 RK4 HNN
-            net = FourthOrderHNN(H_size, activation='tanh')
+            # 使用 1 阶 Forward Euler HNN
+            net = FirstOrderHNN(H_size, activation='tanh')
             
+            model_save_dir = f'../models/1st/h{h:.2f}_run{run+1}'.replace('.', 'p')
             args = {
-                'data': data, 'net': net, 'criterion': net.criterion, 'optimizer': 'adam',
+                'data': data, 'net': net, 'criterion': None, 'optimizer': 'adam',
                 'lr': 0.001, 'iterations': iterations, 'print_every': iterations,
-                'save': 'best_only', 'device': device, 'dtype': 'double'
+                'save': 'best_only', 'device': device, 'dtype': 'double',
+                "model_save_dir": model_save_dir
             }
             
             ln.Brain.Init(**args)
             ln.Brain.Run()
-            
-            # L-BFGS 强力优化阶段：将误差压制到 10^-8 以下
-            print("  Fine-tuning with L-BFGS...")
-            ln.Brain.Run(optimizer='LBFGS', lr=1.0, iterations=1000, print_every=200)
-            
             ln.Brain.Restore()
             best_model = ln.Brain.Best_model()
 
@@ -155,6 +204,7 @@ def run_diff_h_experiment():
 
             # 评估 3: 长时预测 (h 保持完全一致)
             # 使用 best_model.predict，它内部已封装了积分器逻辑，与 hnn.py 风格对齐
+            # 设置 keepinitx=True 以包含初始点进行对比
             flow_pred = best_model.predict(x0, h, steps=steps_eval, keepinitx=True, returnnp=True)
             
             lo_mse, lo_mae = calculate_metrics(flow_ref, flow_pred)
@@ -192,20 +242,24 @@ def run_diff_h_experiment():
             
             # 添加参考线
             h_ref = np.array([min(hs_plot), max(hs_plot)])
-            # 估算阶数：MSE ~ h^8, MAE ~ h^4 (对于 4 阶方法)
-            slope = 8 if 'MSE' in metrics_names[idx] else 4
+            # 1st Order Method:
+            # Global Error (MAE usually) ~ O(h^1) => Slope = 1
+            # MSE ~ Error^2 ~ O(h^2) => Slope = 2
+            slope = 2 if 'MSE' in metrics_names[idx] else 1
             ref_val = (h_ref**slope) * (data_plot[-1] / (hs_plot[-1]**slope))
             ax.loglog(h_ref, ref_val, 'k--', label=f'Ref Slope = {slope}')
             
             ax.set_xlabel('Step size h')
             ax.set_ylabel('Error')
-            ax.set_title(f'{metrics_names[idx]} vs Step Size')
+            ax.set_title(f'{metrics_names[idx]} vs Step Size (1st Order HNN)')
             ax.grid(True, which="both", ls="-", alpha=0.2)
             ax.legend()
 
+
     plt.tight_layout()
-    plt.savefig('4_diff_h_consistency_analysis.png')
-    print("\nLog-Log plot saved to 4_diff_h_consistency_analysis.png")
+    plt.savefig('1_diff_h_consistency_analysis.png')
+    print("\nLog-Log plot saved to 1_diff_h_consistency_analysis.png")
+    print("\nLog-Log plot saved to 1_diff_h_consistency_analysis.png")
 
 if __name__ == '__main__':
     run_diff_h_experiment()

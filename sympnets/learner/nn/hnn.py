@@ -27,7 +27,7 @@ class HNN(Algorithm):
     # 测试时的前向传播
     def predict(self, x0, h, steps=1, keepinitx=False, returnnp=False):
         x0 = self._to_tensor(x0)
-        N = max(int(h * 10), 1) # 忽略这个N吧。h是time step，steps是步数，然后忘记N
+        N = 1  # Fixed: use actual step size h without subdivision
         solver = SV(self.ms['H'], None, iterations=10, order=4, N=N)
         res = solver.flow(x0, h, steps) if keepinitx else solver.flow(x0, h, steps)[..., 1:, :].squeeze()  # 返回的是长度为len(steps)的数组
         return res.cpu().detach().numpy() if returnnp else res

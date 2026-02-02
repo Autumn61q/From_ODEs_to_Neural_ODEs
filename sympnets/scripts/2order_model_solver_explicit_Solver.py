@@ -2,12 +2,46 @@ import numpy as np
 import torch
 import learner as ln
 from learner.integrator.hamiltonian import SV
+from learner.utils import grad
 from pendulum import PDData
 import matplotlib.pyplot as plt
 import os
 
 # 环境配置
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# --- 显式二阶 Midpoint (RK2) 积分器 ---
+class Midpoint:
+    """显式二阶 Midpoint 方法（Runge-Kutta 2阶）"""
+    def __init__(self, H, J, N=1):
+        self.H = H
+        self.J = J
+        self.N = N
+        
+    def solve(self, x, h):
+        h_step = h / self.N
+        curr = x
+        for _ in range(self.N):
+            def get_v(z):
+                with torch.enable_grad():
+                    z_tmp = z.detach().requires_grad_(True)
+                    dH = grad(self.H(z_tmp), z_tmp)
+                return dH @ self.J
+            
+            # Midpoint method (RK2)
+            k1 = get_v(curr)
+            k2 = get_v(curr + 0.5 * h_step * k1)
+            curr = curr + h_step * k2
+        return curr
+
+    def flow(self, x, h, steps):
+        X = [x]
+        for _ in range(steps):
+            X.append(self.solve(X[-1], h))
+        dim = x.shape[-1]
+        size = len(x.shape)
+        shape = [steps + 1, dim] if size == 1 else [-1, steps + 1, dim]
+        return torch.cat(X, dim=-1).view(shape)
 
 # 1. 数据类：支持指定步长 h 生成轨迹
 class FlexiblePDData(ln.Data):
@@ -134,7 +168,11 @@ def analyze_short_term_error_separation(best_model, x0_data, h, y_true_data, tru
     predictions = []
     for h_step, num_steps in hs_configs:
         pred = best_model.predict(x0_data, h_step, steps=num_steps, returnnp=True)
-        predictions.append(pred)  # 取最后一步的结果
+        # 只取最后一步的结果
+        if pred.ndim == 3:  # 形状为 [N, steps, dim] 或 [steps, dim]
+            predictions.append(pred[..., -1, :])  # 取最后一步
+        else:
+            predictions.append(pred)
     
     y_h, y_h2, y_h4 = predictions
     
@@ -158,14 +196,16 @@ def analyze_short_term_error_separation(best_model, x0_data, h, y_true_data, tru
     }
 
 def run_diff_h_experiment():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    device = 'gpu' if torch.cuda.is_available() else 'cpu'
+    # 转换 device 为 PyTorch 能识别的格式
+    pytorch_device = 'cuda' if device == 'gpu' else 'cpu'
+    print(f"Using device: {pytorch_device}")
     
     # 固定参数
     x0 = np.array([0.0, 1.0])
     train_num = 20
     test_num = 100
-    num_runs = 15
+    num_runs = 5
     iterations = 30000
     H_size = [2, 30, 30, 1]
     
@@ -192,11 +232,6 @@ def run_diff_h_experiment():
         flow_ref = true_h_solver.flow(x0, h, steps_eval)
 
         for run in range(num_runs):
-            # 自动清理过往模型缓存
-            if os.path.exists('model'):
-                import shutil
-                shutil.rmtree('model')
-                
             print(f"  Run {run+1}/{num_runs}...", end=' ', flush=True)
             
             # 数据生成
@@ -205,10 +240,12 @@ def run_diff_h_experiment():
             # 使用标准的 2 阶 Midpoint HNN
             net = ln.nn.HNN(H_size, activation='tanh')
             
+            model_save_dir = f'../models/2nd/h{h:.2f}_run{run+1}'.replace('.', 'p')
             args = {
                 'data': data, 'net': net, 'criterion': None, 'optimizer': 'adam',
                 'lr': 0.001, 'iterations': iterations, 'print_every': iterations,
-                'save': 'best_only', 'device': device, 'dtype': 'double'
+                'save': 'best_only', 'callback': None, 'dtype': 'double', 'device': device,
+                'model_save_path': model_save_dir
             }
             
             ln.Brain.Init(**args)
@@ -235,11 +272,11 @@ def run_diff_h_experiment():
                                                                data.y_test_np if hasattr(data, 'y_test_np') else data.y_test,
                                                                true_h_solver)
 
-            # 评估 3: 长时预测 (h 保持完全一致，不使用 predict 内部的 N 分步)
-            # 使用 order=2 的 SV 求解器，且 N=1，确保求解器步长就是 h
-            custom_solver = SV(best_model.ms['H'], None, iterations=1, order=2, N=1)
-            x0_tensor = torch.tensor(x0.reshape(1, -1), dtype=torch.float64, device=device)
-            flow_pred = custom_solver.flow(x0_tensor, h, steps_eval).cpu().detach().numpy().reshape(-1, 2)
+            # 评估 3: 长时预测 (h 保持完全一致，使用显式 Midpoint 积分器)
+            # 创建 Midpoint 求解器用于预测
+            midpoint_solver = Midpoint(best_model.ms['H'], best_model.J, N=1)
+            x0_tensor = torch.tensor(x0.reshape(1, -1), dtype=torch.float64, device=pytorch_device)
+            flow_pred = midpoint_solver.flow(x0_tensor, h, steps_eval).cpu().detach().numpy().reshape(-1, 2)
             
             lo_mse, lo_mae = calculate_metrics(flow_ref, flow_pred)
             
@@ -261,15 +298,28 @@ def run_diff_h_experiment():
         all_summary.append({'h': h, 'means': means, 'stds': stds})
 
     # 输出汇总表格（包含Richardson分析结果）
-    print("\n" + "="*170)
-    print(f"{'h':<6} | {'Tr MSE':<10} | {'Tr MAE':<10} | {'Te MSE':<10} | {'Te MAE':<10} | {'Lo MSE':<10} | {'Lo MAE':<10} | "
+    table_lines = []
+    table_lines.append("="*170)
+    table_lines.append(f"{'h':<6} | {'Tr MSE':<10} | {'Tr MAE':<10} | {'Te MSE':<10} | {'Te MAE':<10} | {'Lo MSE':<10} | {'Lo MAE':<10} | "
           f"{'Tr Net':<10} | {'Tr Int':<10} | {'Te Net':<10} | {'Te Int':<10} | {'Lo Net':<10} | {'Lo Int':<10}")
-    print("-" * 170)
+    table_lines.append("-" * 170)
     for res in all_summary:
         m = res['means']
-        print(f"{res['h']:<6.2f} | {m[0]:.2e} | {m[1]:.2e} | {m[2]:.2e} | {m[3]:.2e} | {m[4]:.2e} | {m[5]:.2e} | "
+        line = (f"{res['h']:<6.2f} | {m[0]:.2e} | {m[1]:.2e} | {m[2]:.2e} | {m[3]:.2e} | {m[4]:.2e} | {m[5]:.2e} | "
               f"{m[6]:.2e} | {m[7]:.2e} | {m[8]:.2e} | {m[9]:.2e} | {m[10]:.2e} | {m[11]:.2e}")
-    print("="*170)
+        table_lines.append(line)
+    table_lines.append("="*170)
+    
+    # 打印到控制台
+    print("\n")
+    for line in table_lines:
+        print(line)
+    
+    # 保存到txt文件
+    with open('2nd_result.txt', 'w') as f:
+        for line in table_lines:
+            f.write(line + '\n')
+    print("\nResults saved to 2nd_result.txt")
 
     # 绘图：h 与各类 Error 的 Log-Log 图 (3x3 子图)
     hs_plot = [r['h'] for r in all_summary]
