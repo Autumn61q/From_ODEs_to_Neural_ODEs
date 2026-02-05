@@ -6,10 +6,8 @@ from pendulum import PDData
 import matplotlib.pyplot as plt
 import os
 
-# 环境配置
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# 1. 数据类：支持指定步长 h 生成轨迹
 class FlexiblePDData(ln.Data):
     def __init__(self, x0, h, train_num, test_num, add_h=True):
         super(FlexiblePDData, self).__init__()
@@ -26,28 +24,8 @@ class FlexiblePDData(ln.Data):
     def dim(self):
         return 2
     
+    # generate the ground-truth data using a 6th-order symplectic integrator (SV6)
     def __generate_flow(self, x0, h, num):
-        # # 用二阶中点法（RK2）生成轨迹
-        # def dH(p, q):
-        #     return p, np.sin(q)
-        # x = np.array(x0).reshape(1, -1)
-        # traj = [x[0]]
-        # for i in range(num):
-        #     p, q = traj[-1][0], traj[-1][1]
-        #     dp, dq = dH(p, q)
-        #     # Midpoint method (RK2): second-order Runge-Kutta
-        #     p_mid = p + h / 2 * dp
-        #     q_mid = q + h / 2 * dq
-        #     dp_mid, dq_mid = dH(p_mid, q_mid)
-        #     p_new = p + h * dp_mid
-        #     q_new = q + h * dq_mid
-        #     traj.append([p_new, q_new])
-        # X = np.array(traj)
-        # x, y = X[:-1], X[1:]
-        # if self.add_h:
-        #     x = [x, self.h * np.ones([x.shape[0], 1])]
-        # return x, y
-        # 改用高精度积分器（如 SV6）生成真值数据，这样 RK3 才会体现出阶数误差
         from learner.integrator.hamiltonian import SV
         true_solver = SV(None, lambda p,q: (p, np.sin(q)), iterations=1, order=6, N=100)
         X = true_solver.flow(torch.tensor(x0, dtype=torch.double), h, num).numpy()
@@ -66,31 +44,22 @@ def calculate_metrics(y_true, y_pred):
     mae = np.mean(np.abs(y_true - y_pred))
     return mse, mae
 
+# Richardson extrapolation
 def analyze_error_separation(best_model, x0, h_base, target_time, true_solver):
-    """
-    使用 Richardson 外推分离网络误差和积分器误差（长时预测）
-    
-    返回:
-        - y_h: 步长为 h 的预测结果
-        - y_network: Richardson 外推得到的网络主导结果 (消除积分器误差)
-        - y_true: 高精度真值
-        - network_error: 网络学习误差 (y_network - y_true)
-        - integrator_error_h: h 步长下的积分器误差估计 (y_h - y_network)
-    """
-    # Richardson 外推：用三个不同步长计算
+
     hs = [h_base, h_base/2, h_base/4]
     predictions = []
     
     for h in hs:
         steps = int(target_time / h)
         pred = best_model.predict(x0, h, steps=steps, keepinitx=True, returnnp=True)
-        predictions.append(pred[-1])  # 取终点
+        predictions.append(pred[-1])  # pick the final point
     
     y_h, y_h2, y_h4 = predictions
     
-    # 2点 Richardson 外推：消除 O(h^2) 的积分器误差（2阶方法）
-    # 对于2阶方法，全局误差是 O((Δh)^2)，误差比例为 1:1/4:1/16
-    # Richardson公式：y_network = (4 * y_h4 - y_h2) / 3
+    # 2-point Richardson extrapolation: remove O(h^2) integrator error (2nd-order method)
+    # For a 2nd-order method the global error scales as O(h^2), with ratios 1:1/4:1/16
+    # Richardson formula: y_network = (4 * y_h4 - y_h2) / 3
     y_network = (4 * y_h4 - y_h2) / 3
     
     # 计算高精度真值
@@ -114,17 +83,18 @@ def analyze_error_separation(best_model, x0, h_base, target_time, true_solver):
 
 def analyze_short_term_error_separation(best_model, x0_data, h, y_true_data, true_solver):
     """
-    使用 Richardson 外推分离短时预测（1-step）的网络误差和积分器误差
-    
-    参数:
-        - best_model: 训练好的模型
-        - x0_data: 初始条件数据 (形状: [N, 2])
-        - h: 步长
-        - y_true_data: 真值数据 (形状: [N, 2])
-        - true_solver: 真值求解器
+    Use Richardson extrapolation to separate short-term (1-step) network error
+    and integrator error.
+
+    Parameters:
+        - best_model: trained model
+        - x0_data: initial condition data (shape: [N, 2])
+        - h: step size
+        - y_true_data: ground-truth data (shape: [N, 2])
+        - true_solver: high-precision reference solver
     """
-    # Richardson 外推：保持终点时间相同 (= h)，但用不同步长
-    # h步长预测1步，h/2步长预测2步，h/4步长预测4步
+    # Richardson extrapolation: keep the same final time (= h) but use different step sizes
+    # predict 1 step with h, 2 steps with h/2, and 4 steps with h/4
     hs_configs = [
         (h, 1),      # h, 1 step
         (h/2, 2),    # h/2, 2 steps
@@ -134,23 +104,23 @@ def analyze_short_term_error_separation(best_model, x0_data, h, y_true_data, tru
     predictions = []
     for h_step, num_steps in hs_configs:
         pred = best_model.predict(x0_data, h_step, steps=num_steps, returnnp=True)
-        # 只取最后一步的结果
-        if pred.ndim == 3:  # 形状为 [N, steps, dim] 或 [steps, dim]
-            predictions.append(pred[..., -1, :])  # 取最后一步
+        # only take the final step's result
+        if pred.ndim == 3:  # shape is [N, steps, dim] or [steps, dim]
+            predictions.append(pred[..., -1, :])  # final step
         else:
             predictions.append(pred)
     
     y_h, y_h2, y_h4 = predictions
     
-    # 2点 Richardson 外推：消除 O(h^2) 的积分器误差（2阶方法）
-    # 对于2阶方法，全局误差是 O((Δh)^2)，误差比例为 1:1/4:1/16
-    # Richardson公式：y_network = (4 * y_h4 - y_h2) / 3
+    # 2-point Richardson extrapolation: remove O(h^2) integrator error (2nd-order method)
+    # For a 2nd-order method the global error scales as O(h^2), with ratios 1:1/4:1/16
+    # Richardson formula: y_network = (4 * y_h4 - y_h2) / 3
     y_network = (4 * y_h4 - y_h2) / 3
     
-    # 计算各类误差
-    network_error = np.mean(np.abs(y_network - y_true_data))     # 平均绝对误差
-    integrator_error_h = np.mean(np.abs(y_h - y_network))        # 积分器误差
-    total_error = np.mean(np.abs(y_h - y_true_data))             # 总误差
+    # calculate errors
+    network_error = np.mean(np.abs(y_network - y_true_data))
+    integrator_error_h = np.mean(np.abs(y_h - y_network))
+    total_error = np.mean(np.abs(y_h - y_true_data))
     
     return {
         'y_h': y_h,
@@ -163,11 +133,10 @@ def analyze_short_term_error_separation(best_model, x0_data, h, y_true_data, tru
 
 def run_diff_h_experiment():
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
-    # 转换 device 为 PyTorch 能识别的格式
+    # convert device to PyTorch-recognized format
     pytorch_device = 'cuda' if device == 'gpu' else 'cpu'
     print(f"Using device: {pytorch_device}")
     
-    # 固定参数
     x0 = np.array([0.0, 1.0])
     train_num = 20
     test_num = 100
@@ -175,7 +144,7 @@ def run_diff_h_experiment():
     iterations = 30000
     H_size = [2, 30, 30, 1]
     
-    # 变化的步长 h (训练和推理保持一致)
+    # varied step sizes h (training and inference use the same h)
     # hs = [1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01]
     hs = [0.5, 0.4, 0.3, 0.2, 0.1]
     
@@ -183,27 +152,27 @@ def run_diff_h_experiment():
 
     for h in hs:
         print(f"\n>>>> Testing h = {h} (Consistency Mode)")
-        # 保持训练和测试的总时长恒定，消除采样范围带来的机制转换
-        # T_train = 5.0, T_test = 10.0 (以 h=0.1, num=50 为基准)
+        # keep total training and testing durations constant to avoid mechanism shifts
+        # T_train = 5.0, T_test = 10.0 (using h=0.1, num=50 as baseline)
         current_train_num = int(max(10.0 / h, 1))
         current_test_num = int(max(10.0 / h, 1))
         
         run_stats = []
         
-        # 物理真值分析 (用于长时对比)
+        # physical ground-truth analysis (for long-term comparison)
         T_eval = 0.5
         steps_eval = int(max(T_eval / h, 1))
-        # 确保真值生成的步数能覆盖到 T_eval
+        # ensure the reference solver generates steps covering T_eval
         true_h_solver = SV(None, lambda p,q: (p, np.sin(q)), iterations=1, order=6, N=100)
         flow_ref = true_h_solver.flow(x0, h, steps_eval)
 
         for run in range(num_runs):
             print(f"  Run {run+1}/{num_runs}...", end=' ', flush=True)
             
-            # 数据生成
+            # generate data
             data = FlexiblePDData(x0, h, current_train_num, current_test_num, add_h=True)
             
-            # 使用标准的 2 阶 Midpoint HNN
+            # use the standard 2nd-order midpoint HNN
             net = ln.nn.HNN(H_size, activation='tanh')
             
             model_save_dir = f'../models/2nd/h{h:.2f}_run{run+1}'.replace('.', 'p')
@@ -219,34 +188,34 @@ def run_diff_h_experiment():
             ln.Brain.Restore()
             best_model = ln.Brain.Best_model()
 
-            # 评估 1: 训练集 1-step
+            # Evaluation 1: training set 1-step
             y_tr_pred = best_model.predict(data.X_train[0], data.h, steps=1, returnnp=True)
             tr_mse, tr_mae = calculate_metrics(data.y_train_np if hasattr(data, 'y_train_np') else data.y_train, y_tr_pred)
             
-            # Richardson 外推分离训练集短时预测的误差
+            # Richardson extrapolation to separate short-term errors on training set
             true_h_solver = SV(None, lambda p,q: (p, np.sin(q)), iterations=1, order=6, N=100)
             tr_error_sep = analyze_short_term_error_separation(best_model, data.X_train[0], h, 
                                                                data.y_train_np if hasattr(data, 'y_train_np') else data.y_train, 
                                                                true_h_solver)
             
-            # 评估 2: 测试集 1-step
+            # Evaluation 2: test set 1-step
             y_te_pred = best_model.predict(data.X_test[0], data.h, steps=1, returnnp=True)
             te_mse, te_mae = calculate_metrics(data.y_test_np if hasattr(data, 'y_test_np') else data.y_test, y_te_pred)
             
-            # Richardson 外推分离测试集短时预测的误差
+            # Richardson extrapolation to separate short-term errors on test set
             te_error_sep = analyze_short_term_error_separation(best_model, data.X_test[0], h,
                                                                data.y_test_np if hasattr(data, 'y_test_np') else data.y_test,
                                                                true_h_solver)
 
-            # 评估 3: 长时预测 (h 保持完全一致，不使用 predict 内部的 N 分步)
-            # 使用 order=2 的 SV 求解器，且 N=1，确保求解器步长就是 h
+            # Evaluation 3: long-term prediction (h is kept consistent; do not use predict's internal N subdivisions)
+            # use SV solver with order=2 and N=1 so the solver step equals h
             custom_solver = SV(best_model.ms['H'], None, iterations=1, order=2, N=1)
             x0_tensor = torch.tensor(x0.reshape(1, -1), dtype=torch.float64, device=pytorch_device)
             flow_pred = custom_solver.flow(x0_tensor, h, steps_eval).cpu().detach().numpy().reshape(-1, 2)
             
             lo_mse, lo_mae = calculate_metrics(flow_ref, flow_pred)
             
-            # 评估 4: Richardson 外推分离网络误差和积分器误差
+            # Evaluation 4: Richardson extrapolation to separate network and integrator errors
             true_h_solver = SV(None, lambda p,q: (p, np.sin(q)), iterations=1, order=6, N=100)
             error_sep = analyze_error_separation(best_model, x0, h, 0.5, true_h_solver)
             
@@ -263,7 +232,7 @@ def run_diff_h_experiment():
         stds = np.std(stats_array, axis=0)
         all_summary.append({'h': h, 'means': means, 'stds': stds})
 
-    # 输出汇总表格（包含Richardson分析结果）
+    # output summary table (including Richardson decomposition results)
     table_lines = []
     table_lines.append("="*170)
     table_lines.append(f"{'h':<6} | {'Tr MSE':<10} | {'Tr MAE':<10} | {'Te MSE':<10} | {'Te MAE':<10} | {'Lo MSE':<10} | {'Lo MAE':<10} | "
@@ -276,18 +245,18 @@ def run_diff_h_experiment():
         table_lines.append(line)
     table_lines.append("="*170)
     
-    # 打印到控制台
+    # print to console
     print("\n")
     for line in table_lines:
         print(line)
     
-    # 保存到txt文件
+    # save to txt file
     with open('2nd_result.txt', 'w') as f:
         for line in table_lines:
             f.write(line + '\n')
     print("\nResults saved to 2nd_result.txt")
 
-    # 绘图：h 与各类 Error 的 Log-Log 图 (3x3 子图)
+    # plotting: log-log plots of h vs various errors (3x3 subplots)
     hs_plot = [r['h'] for r in all_summary]
     
     fig, axes = plt.subplots(3, 3, figsize=(20, 15))
@@ -309,11 +278,11 @@ def run_diff_h_experiment():
         ax = axes[row, col]
         
         if idx is not None:
-            # 标准误差指标 (MSE/MAE)
+            # standard error metrics (MSE/MAE)
             data_plot = [r['means'][idx] for r in all_summary]
             ax.loglog(hs_plot, data_plot, 'ro-', label=title, linewidth=2, markersize=8)
             
-            # 添加参考线
+            # add reference line
             h_ref = np.array([min(hs_plot), max(hs_plot)])
             slope = 4 if 'MSE' in title else 2
             ref_val = (h_ref**slope) * (data_plot[-1] / (hs_plot[-1]**slope))
@@ -325,14 +294,14 @@ def run_diff_h_experiment():
             ax.grid(True, which="both", ls="-", alpha=0.2)
             ax.legend()
         else:
-            # 误差分解子图 (总误差、网络误差、积分器误差)
-            if row == 0:  # 训练集
+            # error decomposition subplot (total error, network error, integrator error)
+            if row == 0:  # training set
                 net_idx, int_idx = 6, 7
                 label_net, label_int = 'Train Network', 'Train Integrator'
-            elif row == 1:  # 测试集
+            elif row == 1:  # test set
                 net_idx, int_idx = 8, 9
                 label_net, label_int = 'Test Network', 'Test Integrator'
-            else:  # 长时
+            else:  # long-term
                 net_idx, int_idx = 10, 11
                 label_net, label_int = 'Long Network', 'Long Integrator'
             
