@@ -16,8 +16,13 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 class Config:
     """Configuration parameters for 2nd-order model solver experiment."""
     def __init__(self):
-        # Initial condition and simulation
-        self.x0 = np.array([0.0, 1.0])
+        # Random seed for reproducibility
+        self.random_seed = 42
+        
+        # Number of initial conditions for zero-shot evaluation
+        self.num_train_test_ics = 10  # ICs for full-shot (train + test1)
+        self.num_zero_shot_ics = 10   # ICs for zero-shot (test2)
+        
         self.num_runs = 5
         self.iterations = 30000
         
@@ -36,11 +41,21 @@ class Config:
         self.add_h_feature = True  # Add h as feature to network input
 
 class FlexiblePDData(ln.Data):
-    def __init__(self, x0, h, train_num, test_num, add_h=True):
+    """Data class supporting multiple initial conditions for full-shot evaluation."""
+    def __init__(self, x0_list, h, train_num, test_num, add_h=True):
+        """Initialize with a list of initial conditions.
+        
+        Args:
+            x0_list: List of initial condition arrays, each shape (2,)
+            h: Step size
+            train_num: Number of steps per trajectory for training
+            test_num: Number of steps per trajectory for testing
+            add_h: Whether to add h as feature
+        """
         super(FlexiblePDData, self).__init__()
         # ground truth Hamiltonian: H = 0.5 * p^2 - cos(q)
         self.H = lambda p, q: 0.5 * p**2 - np.cos(q)
-        self.x0 = x0
+        self.x0_list = x0_list
         self.h = h
         self.train_num = train_num
         self.test_num = test_num
@@ -51,9 +66,9 @@ class FlexiblePDData(ln.Data):
     def dim(self):
         return 2
     
-    # generate the ground-truth data using a 6th-order symplectic integrator (SV6)
     def __generate_flow(self, x0, h, num):
-        true_solver = SV(None, lambda p,q: (p, np.sin(q)), iterations=1, order=6, N=100)
+        """Generate flow from a single initial condition."""
+        true_solver = SV(None, lambda p, q: (p, np.sin(q)), iterations=1, order=6, N=100)
         X = true_solver.flow(torch.tensor(x0, dtype=torch.double), h, num).numpy()
         
         x, y = X[:-1], X[1:]
@@ -62,8 +77,51 @@ class FlexiblePDData(ln.Data):
         return x, y
     
     def __init_data(self):
-        self.X_train, self.y_train = self.__generate_flow(self.x0, self.h, self.train_num)
-        self.X_test, self.y_test = self.__generate_flow(self.y_train[-1], self.h, self.test_num)
+        """Concatenate data from all initial conditions."""
+        # Scale the trajectory length for each IC
+        steps_per_ic_train = max(1, int(self.train_num / len(self.x0_list)))
+        steps_per_ic_test = max(1, int(self.test_num / len(self.x0_list)))
+        
+        X_trains = []
+        y_trains = []
+        X_tests = []
+        y_tests = []
+        
+        for x0 in self.x0_list:
+            X_train, y_train = self.__generate_flow(x0, self.h, steps_per_ic_train)
+            if isinstance(X_train, list):
+                X_trains.append(X_train[0])
+            else:
+                X_trains.append(X_train)
+            y_trains.append(y_train)
+            
+            # For test, start from the last point of training trajectory
+            last_point = y_train[-1]
+            X_test, y_test = self.__generate_flow(last_point, self.h, steps_per_ic_test)
+            if isinstance(X_test, list):
+                X_tests.append(X_test[0])
+            else:
+                X_tests.append(X_test)
+            y_tests.append(y_test)
+        
+        # Concatenate all data
+        X_train_data = np.vstack(X_trains)
+        y_train_data = np.vstack(y_trains)
+        X_test_data = np.vstack(X_tests)
+        y_test_data = np.vstack(y_tests)
+        
+        # Add h feature if needed
+        if self.add_h:
+            h_feature_train = self.h * np.ones([X_train_data.shape[0], 1])
+            h_feature_test = self.h * np.ones([X_test_data.shape[0], 1])
+            self.X_train = [X_train_data, h_feature_train]
+            self.X_test = [X_test_data, h_feature_test]
+        else:
+            self.X_train = X_train_data
+            self.X_test = X_test_data
+        
+        self.y_train = y_train_data
+        self.y_test = y_test_data
 
 class DataHelper:
     """Helper class to uniformly access training and test data."""
@@ -159,11 +217,29 @@ def run_diff_h_experiment():
     pytorch_device = 'cuda' if device == 'gpu' else 'cpu'
     print(f"Using device: {pytorch_device}")
     
+    # Generate initial conditions with fixed random seed
+    np.random.seed(config.random_seed)
+    num_total_ics = config.num_train_test_ics + config.num_zero_shot_ics
+    
+    # Generate random initial conditions
+    # Each IC is [q, p] with q in [-π, π] and p in [-2, 2]
+    x0_list_full = []
+    for i in range(num_total_ics):
+        q0 = np.random.uniform(-np.pi, np.pi)
+        p0 = np.random.uniform(-2.0, 2.0)
+        x0_list_full.append(np.array([q0, p0]))
+    
+    # Split into full-shot and zero-shot
+    x0_list_fullshot = x0_list_full[:config.num_train_test_ics]
+    x0_list_zeroshot = x0_list_full[config.num_train_test_ics:]
+    
+    print(f"Generated {len(x0_list_fullshot)} full-shot ICs and {len(x0_list_zeroshot)} zero-shot ICs")
+    
     all_summary = []
 
     for h in config.step_sizes:
-        print(f"\n>>>> Testing h = {h} (Consistency Mode)")
-        # Keep total training and testing durations constant to avoid mechanism shifts
+        print(f"\n>>>> Testing h = {h}")
+        # Keep total training and testing durations constant
         current_train_num = int(max(10.0 / h, 1))
         current_test_num = int(max(10.0 / h, 1))
         
@@ -172,21 +248,24 @@ def run_diff_h_experiment():
         # Physical ground-truth analysis (for long-term comparison)
         steps_eval = int(max(config.T_eval / h, 1))
         true_h_solver = SV(None, lambda p, q: (p, np.sin(q)), iterations=1, order=6, N=100)
-        flow_ref = true_h_solver.flow(torch.tensor(config.x0, dtype=torch.double), h, steps_eval)
 
         for run in range(config.num_runs):
             print(f"  Run {run+1}/{config.num_runs}...", end=' ', flush=True)
             
-            # Generate data
-            data = FlexiblePDData(config.x0, h, current_train_num, current_test_num, 
-                                  add_h=config.add_h_feature)
+            # Generate full-shot data from full-shot ICs
+            data_fullshot = FlexiblePDData(x0_list_fullshot, h, current_train_num, current_test_num, 
+                                           add_h=config.add_h_feature)
+            
+            # Generate zero-shot data from zero-shot ICs
+            data_zeroshot = FlexiblePDData(x0_list_zeroshot, h, current_train_num, current_test_num,
+                                          add_h=config.add_h_feature)
             
             # Use the standard 2nd-order midpoint HNN
             net = ln.nn.HNN(config.H_size, activation='tanh')
             
             model_save_dir = f'../models/2nd/h{h:.2f}_run{run+1}'.replace('.', 'p')
             args = {
-                'data': data, 'net': net, 'criterion': config.criterion, 
+                'data': data_fullshot, 'net': net, 'criterion': config.criterion, 
                 'optimizer': config.optimizer, 'lr': config.lr, 
                 'iterations': config.iterations, 'print_every': config.iterations,
                 'save': 'best_only', 'callback': None, 'dtype': 'double', 'device': device,
@@ -198,64 +277,59 @@ def run_diff_h_experiment():
             ln.Brain.Restore()
             best_model = ln.Brain.Best_model()
 
-            # Evaluation 1: training set 1-step
-            X_train = DataHelper.get_X_train(data)
-            y_train = DataHelper.get_y_train(data)
-            y_tr_pred = best_model.predict(X_train, data.h, steps=1, returnnp=True)
+            # Evaluation 1: training set 1-step (full-shot)
+            X_train = DataHelper.get_X_train(data_fullshot)
+            y_train = DataHelper.get_y_train(data_fullshot)
+            y_tr_pred = best_model.predict(X_train, data_fullshot.h, steps=1, returnnp=True)
             tr_mse, tr_mae = calculate_metrics(y_train, y_tr_pred)
             
-            # Richardson extrapolation to separate short-term errors on training set
-            # true_h_solver = SV(None, lambda p, q: (p, np.sin(q)), iterations=1, order=6, N=100)
-            # tr_error_sep = analyze_error_separation(best_model, X_train, h, 
-            #                                         y_true_data=y_train, 
-            #                                         true_solver=true_h_solver, mode='short_term')
-            tr_error_sep = {'network_error': 0.0, 'integrator_error': 0.0}
-            
-            # Evaluation 2: test set 1-step
-            X_test = DataHelper.get_X_test(data)
-            y_test = DataHelper.get_y_test(data)
-            y_te_pred = best_model.predict(X_test, data.h, steps=1, returnnp=True)
+            # Evaluation 2: test set 1-step (full-shot)
+            X_test = DataHelper.get_X_test(data_fullshot)
+            y_test = DataHelper.get_y_test(data_fullshot)
+            y_te_pred = best_model.predict(X_test, data_fullshot.h, steps=1, returnnp=True)
             te_mse, te_mae = calculate_metrics(y_test, y_te_pred)
             
-            # Richardson extrapolation to separate short-term errors on test set
-            # te_error_sep = analyze_error_separation(best_model, X_test, h,
-            #                                         y_true_data=y_test,
-            #                                         true_solver=true_h_solver, mode='short_term')
-            te_error_sep = {'network_error': 0.0, 'integrator_error': 0.0}
-
-            # Evaluation 3: long-term prediction (h is kept consistent; do not use predict's internal N subdivisions)
-            # use SV solver with order=2 and N=1 so the solver step equals h
+            # Evaluation 3: zero-shot 1-step (unseen ICs)
+            X_zeroshot = DataHelper.get_X_train(data_zeroshot)
+            y_zeroshot = DataHelper.get_y_train(data_zeroshot)
+            y_zero_pred = best_model.predict(X_zeroshot, data_zeroshot.h, steps=1, returnnp=True)
+            zero_mse, zero_mae = calculate_metrics(y_zeroshot, y_zero_pred)
+            
+            # Evaluation 4: long-term prediction on first full-shot IC
             custom_solver = SV(best_model.ms['H'], None, iterations=1, order=2, N=1)
-            x0_tensor = torch.tensor(config.x0.reshape(1, -1), dtype=torch.float64, device=pytorch_device)
-            flow_pred = custom_solver.flow(x0_tensor, h, steps_eval).cpu().detach().numpy().reshape(-1, 2)
+            x0_long = torch.tensor(x0_list_fullshot[0].reshape(1, -1), dtype=torch.float64, device=pytorch_device)
+            flow_pred = custom_solver.flow(x0_long, h, steps_eval).cpu().detach().numpy().reshape(-1, 2)
             
-            lo_mse, lo_mae = calculate_metrics(flow_ref.cpu().detach().numpy().reshape(-1, 2), flow_pred)
+            # Ground truth for long-term
+            flow_ref = true_h_solver.flow(torch.tensor(x0_list_fullshot[0], dtype=torch.double), h, steps_eval)
+            flow_ref_np = flow_ref.cpu().detach().numpy().reshape(-1, 2)
+            lo_mse, lo_mae = calculate_metrics(flow_ref_np, flow_pred)
             
-            # Evaluation 4: Richardson extrapolation to separate network and integrator errors on long-term
-            # true_h_solver = SV(None, lambda p, q: (p, np.sin(q)), iterations=1, order=6, N=100)
-            # # For long-term analysis: use the final step of the long-term evolution as true reference
-            # error_sep = analyze_error_separation(best_model, config.x0, h, 
-            #                                     y_true_data=flow_ref.cpu().detach().numpy()[-1].reshape(-1),
-            #                                     true_solver=true_h_solver, mode='short_term')
-            error_sep = {'network_error': 0.0, 'integrator_error': 0.0}
+            # Evaluation 5: long-term prediction on first zero-shot IC
+            x0_zero_long = torch.tensor(x0_list_zeroshot[0].reshape(1, -1), dtype=torch.float64, device=pytorch_device)
+            flow_zero_pred = custom_solver.flow(x0_zero_long, h, steps_eval).cpu().detach().numpy().reshape(-1, 2)
             
-            run_stats.append([tr_mse, tr_mae, te_mse, te_mae, lo_mse, lo_mae])
-            print(f"Tr(MSE:{tr_mse:.2e}, MAE:{tr_mae:.2e}) | "
-                  f"Te(MSE:{te_mse:.2e}, MAE:{te_mae:.2e}) | "
-                  f"Lo(MSE:{lo_mse:.2e}, MAE:{lo_mae:.2e})")
+            # Ground truth for zero-shot long-term
+            flow_zero_ref = true_h_solver.flow(torch.tensor(x0_list_zeroshot[0], dtype=torch.double), h, steps_eval)
+            flow_zero_ref_np = flow_zero_ref.cpu().detach().numpy().reshape(-1, 2)
+            lo_zero_mse, lo_zero_mae = calculate_metrics(flow_zero_ref_np, flow_zero_pred)
+            
+            # Record only MAE (no MSE)
+            run_stats.append([tr_mae, te_mae, zero_mae, lo_mae, lo_zero_mae])
+            print(f"Full: TR[{tr_mae:.2e}] TE[{te_mae:.2e}] | Zero: 1-step[{zero_mae:.2e}] Long[{lo_zero_mae:.2e}]")
 
         stats_array = np.array(run_stats)
         means = np.mean(stats_array, axis=0)
         stds = np.std(stats_array, axis=0)
         all_summary.append({'h': h, 'means': means, 'stds': stds})
 
-    # output summary table
+    # output summary table (MAE only)
     table_lines = []
-    table_lines.append(f"{'h':<6} | {'Tr MSE':<10} | {'Tr MAE':<10} | {'Te MSE':<10} | {'Te MAE':<10} | {'Lo MSE':<10} | {'Lo MAE':<10}")
-    table_lines.append("-" * 84)
+    table_lines.append(f"{'h':<6} | {'Tr MAE':<12} | {'Te MAE':<12} | {'Zero MAE':<12} | {'Lo MAE':<12} | {'Lo Zero MAE':<12}")
+    table_lines.append("-" * 75)
     for res in all_summary:
         m = res['means']
-        line = (f"{res['h']:<6.2f} | {m[0]:.2e} | {m[1]:.2e} | {m[2]:.2e} | {m[3]:.2e} | {m[4]:.2e} | {m[5]:.2e}")
+        line = (f"{res['h']:<6.2f} | {m[0]:.2e} | {m[1]:.2e} | {m[2]:.2e} | {m[3]:.2e} | {m[4]:.2e}")
         table_lines.append(line)
     
     # print to console
@@ -269,43 +343,43 @@ def run_diff_h_experiment():
             f.write(line + '\n')
     print("\nResults saved to 2nd_result.txt")
 
-    # plotting: log-log plots of h vs various errors (2x3 subplots)
+    # plotting: log-log plots of MAE only (2x3 subplots)
     hs_plot = [r['h'] for r in all_summary]
     
-    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    axes = axes.flatten()
     
     plot_configs = [
-        # (row, col, idx, title)
-        (0, 0, 0, 'Train MSE'),
-        (0, 1, 1, 'Train MAE'),
-        (0, 2, 2, 'Test MSE'),
-        (1, 0, 3, 'Test MAE'),
-        (1, 1, 4, 'Long-term MSE'),
-        (1, 2, 5, 'Long-term MAE'),
+        # (idx, title, label)
+        (0, 'Train MAE (Full-shot)', 'Train MAE'),
+        (1, 'Test MAE (Full-shot)', 'Test MAE'),
+        (2, 'Zero-shot 1-step MAE', 'Zero-shot MAE'),
+        (3, 'Long-term MAE (Full-shot)', 'Long-term MAE'),
+        (4, 'Long-term MAE (Zero-shot)', 'Zero-shot Long MAE'),
     ]
     
-    for row, col, idx, title in plot_configs:
-        ax = axes[row, col]
-        
-        # standard error metrics (MSE/MAE)
+    for plot_idx, (idx, title, label) in enumerate(plot_configs):
+        ax = axes[plot_idx]
         data_plot = [r['means'][idx] for r in all_summary]
-        ax.loglog(hs_plot, data_plot, 'ro-', label=title, linewidth=2, markersize=8)
+        ax.loglog(hs_plot, data_plot, 'ro-', label=label, linewidth=2, markersize=8)
         
-        # add reference line
+        # add reference line (slope = 2 for MAE)
         h_ref = np.array([min(hs_plot), max(hs_plot)])
-        slope = 4 if 'MSE' in title else 2
-        ref_val = (h_ref**slope) * (data_plot[-1] / (hs_plot[-1]**slope))
-        ax.loglog(h_ref, ref_val, 'k--', label=f'Ref Slope = {slope}', alpha=0.5)
+        ref_val = (h_ref**2) * (data_plot[-1] / (hs_plot[-1]**2))
+        ax.loglog(h_ref, ref_val, 'k--', label='Ref Slope = 2', alpha=0.5)
         
         ax.set_xlabel('Step size h')
-        ax.set_ylabel('Error')
+        ax.set_ylabel('MAE')
         ax.set_title(title)
         ax.grid(True, which="both", ls="-", alpha=0.2)
         ax.legend()
+    
+    # Hide last subplot
+    axes[5].set_visible(False)
 
     plt.tight_layout()
-    plt.savefig('2_diff_h_convergence_analysis_2x3.png', dpi=150)
-    print("\nLog-Log plot saved to 2_diff_h_convergence_analysis_2x3.png")
+    plt.savefig('2_fullshot_zeroshot_mae_convergence.png', dpi=150)
+    print("\nLog-Log MAE plot saved to 2_fullshot_zeroshot_mae_convergence.png")
 
 if __name__ == '__main__':
     run_diff_h_experiment()

@@ -1,11 +1,16 @@
 import numpy as np
 import torch
+import sys
+import os
+
+# 添加上级目录到Python路径，以便导入learner模块
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import learner as ln
 from learner.integrator.hamiltonian import SV
 from learner.utils import grad, lazy_property
 from pendulum import PDData
 import matplotlib.pyplot as plt
-import os
 
 # 环境配置
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -234,7 +239,8 @@ def run_diff_h_experiment():
     
     # 变化的步长 h (训练和推理保持一致)
     # hs = [1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01]
-    hs = [0.5, 0.4, 0.3, 0.2, 0.1]
+    hs = [0.1,]
+    # hs = [0.5, 0.4, 0.3, 0.2, 0.1]
     
     all_summary = []
 
