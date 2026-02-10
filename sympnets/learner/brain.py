@@ -111,7 +111,7 @@ class Brain:
                 if self.save == False:
                     pass
                 elif self.save in [True, 'best_only', 'best_only_test', 'best_only_train', 'all']:
-                    if not os.path.exists(self.model_save_path): os.mkdir(self.model_save_path)
+                    if not os.path.exists(self.model_save_path): os.makedirs(self.model_save_path)
                     if self.save == 'all':
                         torch.save(self.net, '{}/model{}.pkl'.format(self.model_save_path, i))
                     else:
