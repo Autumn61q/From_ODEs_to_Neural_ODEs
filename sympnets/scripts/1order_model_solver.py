@@ -23,7 +23,7 @@ class Config:
         self.num_train_test_ics = 10  # ICs for full-shot (train + test1)
         self.num_zero_shot_ics = 10   # ICs for zero-shot (test2)
         
-        self.num_runs = 3
+        self.num_runs = 5
         self.iterations = 30000
         
         # Neural network architecture
