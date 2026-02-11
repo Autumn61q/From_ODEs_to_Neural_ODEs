@@ -1,7 +1,10 @@
 The code are changed based on the [here](https://github.com/jpzxshi/learner/blob/master/learner/nn/hnn.py)
 
 # How to Start
+## 1. Slides 
+Slides are placed [here](https://github.com/Autumn61q/From_ODEs_to_Neural_ODEs/blob/main/slides/From_ODEs_to_Neural_ODEs.pdf)
 
+## 2. Experiments
 The entry-point scripts are located in  
 [sympnets/scripts](https://github.com/Autumn61q/From_ODEs_to_Neural_ODEs/tree/main/sympnets/scripts).
 
