@@ -31,13 +31,14 @@ class Config:
         
         # Training configuration
         # self.step_sizes = [0.2, 0.1,]
-        self.step_sizes = [0.5, 0.4, 0.3, 0.2, 0.1]
+        # self.step_sizes = [0.5, 0.4, 0.3, 0.2, 0.1]
+        self.step_sizes = [0.8, 0.7, 0.6, 0.5, 0.4, 0.3]
         self.lr = 0.001
         self.criterion = None
         self.optimizer = 'adam'
         
         # Evaluation configuration
-        self.T_eval = 0.5  # Evaluation time window
+        self.T_eval = 50  # Evaluation time window
         self.add_h_feature = True  # Add h as feature to network input
 
 class FlexiblePDData(ln.Data):
@@ -257,7 +258,7 @@ def run_diff_h_experiment():
                                            add_h=config.add_h_feature)
             
             # Generate zero-shot data from zero-shot ICs
-            data_zeroshot = FlexiblePDData(x0_list_zeroshot, h, current_train_num, current_test_num,
+            data_zeroshot = FlexiblePDData(x0_list_zeroshot, h, current_train_num, current_test_num,2nd
                                           add_h=config.add_h_feature)
             
             # Use the standard 2nd-order midpoint HNN

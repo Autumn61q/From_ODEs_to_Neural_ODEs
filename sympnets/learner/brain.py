@@ -125,7 +125,7 @@ class Brain:
                     to_stop = self.callback(self.data, self.net)
                     if to_stop: break
             if i < self.iterations:
-                if self.optimizer in ['LBFGS']:
+                if self.optimizer in ['LBFGS', 'lbfgs']:
                     def closure():
                         self.__optimizer.zero_grad()
                         loss = self.__criterion(self.net(X_train), y_train)
@@ -262,12 +262,21 @@ class Brain:
         self.__init_criterion()
     
     def __init_optimizer(self):
-        if self.optimizer in ['Adam', 'adam']:
-            self.__optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
-        elif self.optimizer == 'LBFGS':
+        if self.optimizer in ['AdamW', 'adamw']:
+            self.__optimizer = torch.optim.AdamW(self.net.parameters(), lr=self.lr)
+        elif self.optimizer in ['AdaBelief', 'adabelief']:
+            try:
+                from adabelief_pytorch import AdaBelief
+                self.__optimizer = AdaBelief(self.net.parameters(), lr=self.lr, rectify=True)
+            except ImportError:
+                raise ImportError('AdaBelief not installed. Please install it with: pip install adabelief-pytorch')
+        elif self.optimizer in ['LBFGS', 'lbfgs']:
             self.__optimizer = torch.optim.LBFGS(self.net.parameters(), lr=self.lr)
+        elif self.optimizer in ['Adam', 'adam']:
+            # Legacy support for Adam
+            self.__optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f'Optimizer {self.optimizer} not supported. Choose from: AdamW, AdaBelief, LBFGS')
     
     def __init_criterion(self):
         if isinstance(self.net, Algorithm):
