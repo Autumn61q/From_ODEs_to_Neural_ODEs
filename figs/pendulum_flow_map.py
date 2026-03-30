@@ -18,11 +18,8 @@ for q0 in q_init:
         q_traj = trajectory[:, 0]
         p_traj = trajectory[:, 1]
 
-        # 画轨迹
         ax.plot(q_traj, p_traj, color='royalblue', alpha=0.8, linewidth=1.4)
 
-        # ---- 在轨迹上加箭头 ----
-        # 选几个点作为箭头位置
         arrow_indices = np.linspace(50, len(t)-50, 4).astype(int)
 
         for idx in arrow_indices:
@@ -34,7 +31,7 @@ for q0 in q_init:
 
             ax.arrow(
                 q_traj[idx], p_traj[idx],
-                0.2 * dq, 0.2 * dp,     # 箭头长度
+                0.2 * dq, 0.2 * dp,
                 head_width=0.25,
                 head_length=0.25,
                 fc='royalblue',

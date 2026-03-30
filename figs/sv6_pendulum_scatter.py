@@ -152,12 +152,12 @@ def main():
     Y = np.vstack(Y_list)         # targets
 
     # Save dataset
-    np.savez("sv6_pendulum_dataset.npz", x=X, y=Y, h=h)
-    print(f"[Saved] sv6_pendulum_dataset.npz  (x shape {X.shape}, y shape {Y.shape}, h={h})")
+    # np.savez("sv6_pendulum_dataset.npz", x=X, y=Y, h=h)
+    # print(f"[Saved] sv6_pendulum_dataset.npz  (x shape {X.shape}, y shape {Y.shape}, h={h})")
 
     # Plot scatter in phase space
     fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
-    k = 15   # 每10个点取1个，点立即变稀疏
+    k = 15
     ax.scatter(cloud[::k, 0], cloud[::k, 1],
            s=20, c='royalblue', alpha=0.6, edgecolors='none')
 
